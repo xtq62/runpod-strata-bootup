@@ -10,8 +10,17 @@ set -Eeuo pipefail
 #   Vision  : GPU
 #   Context : 131072
 #
-# Uses our own prebuilt Strata engine.
-# Local compilation is not expected.
+# Uses our own RTX 3090 / sm_86 prebuilt Strata engine.
+#
+# IMPORTANT:
+#   CPU / RAM / PCIe dependent tuning is NOT reused between Pods.
+#
+#   These are always left on Strata auto/default:
+#     --pcie-frac
+#     --spec-min-p
+#     --pool-workers
+#
+# No local Strata compilation is expected.
 # ============================================================
 
 
@@ -52,6 +61,10 @@ PID_FILE="${WORKSPACE}/.strata-server.pid"
 PORT="8000"
 CONTEXT="131072"
 
+# Host-pinned arena limit.
+# This is NOT the old EPYC calibration profile.
+ARENA_PIN_GIB="8"
+
 
 # ------------------------------------------------------------
 # Helpers
@@ -84,17 +97,20 @@ echo
 
 missing=()
 
-command -v git >/dev/null 2>&1 || missing+=(git)
-command -v curl >/dev/null 2>&1 || missing+=(curl)
-command -v unzip >/dev/null 2>&1 || missing+=(unzip)
+command -v git     >/dev/null 2>&1 || missing+=(git)
+command -v curl    >/dev/null 2>&1 || missing+=(curl)
+command -v unzip   >/dev/null 2>&1 || missing+=(unzip)
 command -v python3 >/dev/null 2>&1 || missing+=(python3)
 
 if (( ${#missing[@]} )); then
     info "Installing dependencies: ${missing[*]}"
 
     apt-get update
+
     DEBIAN_FRONTEND=noninteractive \
-        apt-get install -y "${missing[@]}" ca-certificates
+        apt-get install -y \
+        "${missing[@]}" \
+        ca-certificates
 fi
 
 
@@ -116,11 +132,51 @@ GPU_NAME="$(
         | xargs
 )"
 
+GPU_VRAM="$(
+    nvidia-smi \
+        --query-gpu=memory.total \
+        --format=csv,noheader \
+        | head -n1 \
+        | xargs
+)"
+
 info "GPU: ${GPU_NAME}"
+info "VRAM: ${GPU_VRAM}"
 
 if [[ "$GPU_NAME" != *"RTX 3090"* ]]; then
     die "This bootstrap is for RTX 3090. Refusing to use the sm_86 prebuilt on: ${GPU_NAME}"
 fi
+
+
+# ------------------------------------------------------------
+# Hardware fingerprint
+#
+# Informational only.
+# We intentionally do NOT derive fixed tuning values from this.
+# ------------------------------------------------------------
+
+CPU_NAME="$(
+    lscpu 2>/dev/null \
+        | awk -F: '/Model name/ {
+            sub(/^[ \t]+/, "", $2)
+            print $2
+            exit
+        }'
+)"
+
+LOGICAL_CPUS="$(nproc)"
+
+PHYSICAL_CORES="$(
+    lscpu -p=CORE,SOCKET 2>/dev/null \
+        | grep -v '^#' \
+        | sort -u \
+        | wc -l \
+        | xargs
+)"
+
+info "CPU: ${CPU_NAME:-unknown}"
+info "Physical cores: ${PHYSICAL_CORES:-unknown}"
+info "Logical CPUs: ${LOGICAL_CPUS}"
 
 
 # ------------------------------------------------------------
@@ -192,7 +248,8 @@ if [[ "$CURRENT_COMMIT" != "$STRATA_COMMIT" ]]; then
     info "Switching Strata to fixed commit:"
     echo "    ${STRATA_COMMIT}"
 
-    git fetch origin "$STRATA_COMMIT" || git fetch origin
+    git fetch origin "$STRATA_COMMIT" \
+        || git fetch origin
 
     git checkout --detach "$STRATA_COMMIT"
 fi
@@ -222,11 +279,15 @@ if [[ -f "$PREBUILT_ZIP" ]]; then
     )"
 
     if [[ "$HAVE_SHA" == "$PREBUILT_SHA256" ]]; then
+
         NEED_DOWNLOAD=0
         info "Cached prebuilt archive verified"
+
     else
+
         warn "Cached prebuilt checksum mismatch; downloading again"
         rm -f "$PREBUILT_ZIP"
+
     fi
 fi
 
@@ -275,7 +336,8 @@ import sys
 p = sys.argv[1]
 
 try:
-    d = json.load(open(p))
+    with open(p) as f:
+        d = json.load(f)
 except Exception:
     raise SystemExit(1)
 
@@ -338,6 +400,7 @@ required = {
 }
 
 for key, expected in required.items():
+
     actual = d.get(key)
 
     if actual != expected:
@@ -367,6 +430,7 @@ PY
 # ------------------------------------------------------------
 
 info "Running Strata model setup"
+
 echo
 echo "    Model   : IQ3_S"
 echo "    Context : ${CONTEXT}"
@@ -399,10 +463,31 @@ echo
 
 
 # ------------------------------------------------------------
-# Apply our calibrated RTX 3090 / EPYC settings
+# Hardware tuning policy
+#
+# IMPORTANT:
+#
+# Do NOT reuse these values between RunPod hosts:
+#
+#   --pcie-frac
+#   --spec-min-p
+#   --pool-workers
+#
+# Previous calibration:
+#
+#   EPYC host:
+#       --pcie-frac     0.00
+#       --spec-min-p    0.70
+#       --pool-workers  64
+#
+# Those values caused severe oversubscription on a
+# Threadripper PRO 3955WX 16C/32T host.
+#
+# Always remove them here and let Strata choose defaults
+# appropriate for the current hardware.
 # ------------------------------------------------------------
 
-info "Applying calibrated tuning"
+info "Using Strata hardware auto/default tuning"
 
 python3 - "$CONFIG" "$PORT" <<'PY'
 import json
@@ -416,42 +501,68 @@ with open(path) as f:
 
 args = cfg.setdefault("args", [])
 
-settings = {
-    "--pcie-frac": "0.00",
-    "--spec-min-p": "0.70",
-    "--pool-workers": "64",
-}
+hardware_dependent = (
+    "--pcie-frac",
+    "--spec-min-p",
+    "--pool-workers",
+)
 
-for option, value in settings.items():
+for option in hardware_dependent:
 
-    while args.count(option) > 1:
-        i = len(args) - 1 - args[::-1].index(option)
+    while option in args:
 
-        del args[i:i + 2]
-
-    if option in args:
         i = args.index(option)
 
-        if i + 1 < len(args):
-            args[i + 1] = value
-        else:
-            args.append(value)
-
-    else:
-        args.extend([option, value])
+        # These options all take exactly one following value.
+        del args[i:i + 2]
 
 
+# Network
 cfg["host"] = "0.0.0.0"
 cfg["port"] = port
+
+
+# Context safety:
+#
+# If prompt + requested max_tokens exceeds the model context,
+# Strata automatically reduces max_tokens to the available room
+# instead of returning HTTP 400.
+cfg["fit_max_tokens"] = True
 
 
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
 
 
-print("    --pcie-frac     0.00")
-print("    --spec-min-p    0.70")
-print("    --pool-workers  64")
+print("    --pcie-frac     auto")
+print("    --spec-min-p    auto/default")
+print("    --pool-workers  auto")
+print("    fit_max_tokens  true")
+PY
+
+
+# ------------------------------------------------------------
+# Verify hardware tuning really is AUTO
+# ------------------------------------------------------------
+
+python3 - "$CONFIG" <<'PY'
+import json
+import sys
+
+cfg = json.load(open(sys.argv[1]))
+args = cfg.get("args", [])
+
+for option in (
+    "--pcie-frac",
+    "--spec-min-p",
+    "--pool-workers",
+):
+    if option in args:
+        raise SystemExit(
+            f"{option} is unexpectedly fixed in config"
+        )
+
+print("[+] Hardware-dependent tuning is AUTO/default")
 PY
 
 
@@ -474,7 +585,43 @@ if int(cfg.get("port", 0)) != 8000:
 if not cfg.get("api_key"):
     raise SystemExit("API key was not saved into Strata config")
 
-print("[+] Network/API configuration verified")
+if cfg.get("fit_max_tokens") is not True:
+    raise SystemExit("fit_max_tokens is not enabled")
+
+print("[+] Network/API/context configuration verified")
+PY
+
+
+# ------------------------------------------------------------
+# Show effective configuration
+# ------------------------------------------------------------
+
+info "Effective Strata configuration"
+
+python3 - "$CONFIG" <<'PY'
+import json
+import sys
+
+cfg = json.load(open(sys.argv[1]))
+args = cfg.get("args", [])
+
+def value(flag):
+    if flag not in args:
+        return "auto/default"
+
+    i = args.index(flag)
+
+    if i + 1 >= len(args):
+        return "(missing value)"
+
+    return args[i + 1]
+
+print("    host             :", cfg.get("host"))
+print("    port             :", cfg.get("port"))
+print("    fit_max_tokens   :", cfg.get("fit_max_tokens"))
+print("    --pcie-frac      :", value("--pcie-frac"))
+print("    --spec-min-p     :", value("--spec-min-p"))
+print("    --pool-workers   :", value("--pool-workers"))
 PY
 
 
@@ -492,6 +639,9 @@ then
 
     info "Strata is already running on port ${PORT}"
 
+    warn "Existing process was not restarted."
+    warn "If its config was changed by this bootstrap, restart Strata once to apply it."
+
 else
 
     info "Starting Strata"
@@ -499,7 +649,7 @@ else
     cd "$STRATA_DIR"
 
     nohup env \
-        STRATA_ARENA_PIN_GIB=8 \
+        STRATA_ARENA_PIN_GIB="$ARENA_PIN_GIB" \
         ./run-iq3_s.sh \
         > "$LOG_FILE" 2>&1 &
 
@@ -525,6 +675,9 @@ export OPENAI_BASE_PATH="v1/chat/completions"
 
 export GOOSE_PROVIDER="openai"
 export GOOSE_MODEL="qwen3.8-flash-next-iq3_s"
+
+# Goose's own working context target.
+# Qwen/Strata itself is configured for 131072.
 export GOOSE_CONTEXT_LIMIT=32768
 EOF
 
@@ -540,47 +693,73 @@ echo "=============================================="
 echo " Bootstrap complete"
 echo "=============================================="
 echo
+
+echo "Hardware:"
+echo "  GPU : ${GPU_NAME}"
+echo "  VRAM: ${GPU_VRAM}"
+echo "  CPU : ${CPU_NAME:-unknown}"
+echo "  Physical cores: ${PHYSICAL_CORES:-unknown}"
+echo "  Logical CPUs  : ${LOGICAL_CPUS}"
+echo
+
 echo "Strata commit:"
 echo "  ${STRATA_COMMIT}"
 echo
+
 echo "Engine:"
 echo "  custom RTX 3090 / sm_86 prebuilt"
 echo
+
 echo "Model:"
 echo "  qwen3.8-flash-next-iq3_s"
 echo
+
 echo "Vision:"
 echo "  GPU"
 echo
+
 echo "Context:"
 echo "  ${CONTEXT}"
 echo
+
 echo "Port:"
 echo "  ${PORT}"
 echo
-echo "Tuning:"
-echo "  --pcie-frac 0.00"
-echo "  --spec-min-p 0.70"
-echo "  --pool-workers 64"
-echo "  STRATA_ARENA_PIN_GIB=8"
+
+echo "Hardware-dependent tuning:"
+echo "  --pcie-frac     auto/default"
+echo "  --spec-min-p    auto/default"
+echo "  --pool-workers  auto"
 echo
+
+echo "Runtime:"
+echo "  STRATA_ARENA_PIN_GIB=${ARENA_PIN_GIB}"
+echo "  fit_max_tokens=true"
+echo
+
 echo "API key:"
 echo "  ${KEY_FILE}"
 echo
+
 echo "Show API key:"
 echo "  cat ${KEY_FILE}"
 echo
+
 echo "Startup log:"
 echo "  tail -f ${LOG_FILE}"
 echo
+
 echo "Check API after startup:"
 echo "  curl -s http://127.0.0.1:${PORT}/v1/models \\"
 echo '    -H "Authorization: Bearer $(cat /workspace/.strata-api-key)"'
 echo
+
 echo "Load helper environment:"
 echo "  source /workspace/strata-env.sh"
 echo
+
 echo "NOTE:"
 echo "  IQ3_S model files still need to be downloaded on a fresh workspace."
-echo "  The Strata engine and strata-vision compilation have been eliminated."
+echo "  Strata and strata-vision compilation are eliminated by the prebuilt."
+echo "  CPU/PCIe calibration results are intentionally NOT reused across Pods."
 echo
